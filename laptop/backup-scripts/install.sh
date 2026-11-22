@@ -11,4 +11,4 @@ systemctl restart laptop-backup-full.timer laptop-backup-incr.timer
 systemctl start --no-block laptop-backup@full.service
 echo "Timers:"
 systemctl list-timers laptop-backup-full.timer laptop-backup-incr.timer --no-pager
-echo "Full backup started. Log: /var/log/laptop-backup.log"
+echo "Full backup started. Log: /srv/maintenance/reports/backup/latest.log"

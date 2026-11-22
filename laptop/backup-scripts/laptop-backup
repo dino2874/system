@@ -1,5 +1,5 @@
 #!/bin/bash
-# Snapshot this laptop onto the drive labeled "Laptop Backup".
+# Snapshot this laptop onto the drive labeled "Laptop-Backup".
 #   full  Complete copy. After it succeeds, older snapshots are removed.
 #   incr  Complete restorable copy. Unchanged files are reused from the
 #         newest snapshot, so the extra space is only what changed.
@@ -13,7 +13,7 @@ fi
 
 MNT="/mnt/laptop-backup"
 SNAPDIR="laptop-snapshots"
-LINKPATH="/dev/disk/by-label/Laptop\\x20Backup"
+BACKUP_LABEL="Laptop-Backup"
 REPORT_DIR="/srv/maintenance/reports/backup"
 
 mkdir -p "$REPORT_DIR"
@@ -27,11 +27,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-if [[ ! -e "$LINKPATH" ]]; then
-  echo "Drive labeled \"Laptop Backup\" is not connected. Backup skipped."
+DEV=$(blkid -L "$BACKUP_LABEL" || true)
+if [[ -z "$DEV" ]]; then
+  echo "Drive labeled \"$BACKUP_LABEL\" is not connected. Backup skipped."
   exit 1
 fi
-DEV=$(readlink -f "$LINKPATH")
+DEV=$(readlink -f "$DEV")
 
 MOUNTPOINT=$(findmnt -n -o TARGET -S "$DEV" | head -1 || true)
 MOUNTED_HERE=0
