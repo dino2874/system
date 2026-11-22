@@ -1,0 +1,11 @@
+[Unit]
+Description=Laptop %i backup to the external drive
+After=local-fs.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/sbin/laptop-backup %i

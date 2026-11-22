@@ -1,0 +1,315 @@
+#!/bin/bash
+# Restore this laptop from the newest finished snapshot on the drive
+# labeled "Laptop-Backup".
+#
+# Boot the Ubuntu thumb drive, choose "Try or Install Ubuntu", plug in the
+# backup drive, and run:
+#   sudo bash /path/to/laptop-restore
+#
+# The script copies that snapshot onto the internal disk, puts the EFI
+# files back, and reinstalls the bootloader. It does not run until you
+# type RESTORE.
+set -u
+
+KNOWN_ROOT_UUID="dbfe10b1-60f5-4f6c-ac11-9fce7ca868ce"
+KNOWN_EFI_UUID="E7D2-4DC3"
+EFI_PARTTYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BACKUP_MNT="/mnt/laptop-backup-src"
+ROOT_MNT="/mnt/restore-root"
+EFI_MNT="/mnt/restore-efi"
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+need_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "Run this with sudo from the Ubuntu thumb drive."
+  fi
+}
+
+disk_of() {
+  local dev pk
+  dev=$(readlink -f "$1")
+  pk=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1)
+  if [[ -n "$pk" ]]; then
+    echo "/dev/$pk"
+  else
+    echo "$dev"
+  fi
+}
+
+tran_of() {
+  lsblk -no TRAN "$(disk_of "$1")" 2>/dev/null | head -1
+}
+
+cleanup() {
+  mountpoint -q "$ROOT_MNT/dev" && umount "$ROOT_MNT/dev" || true
+  mountpoint -q "$ROOT_MNT/proc" && umount "$ROOT_MNT/proc" || true
+  mountpoint -q "$ROOT_MNT/sys/firmware/efi/efivars" && umount "$ROOT_MNT/sys/firmware/efi/efivars" || true
+  mountpoint -q "$ROOT_MNT/sys" && umount "$ROOT_MNT/sys" || true
+  mountpoint -q "$ROOT_MNT/run" && umount "$ROOT_MNT/run" || true
+  mountpoint -q "$ROOT_MNT/boot/efi" && umount "$ROOT_MNT/boot/efi" || true
+  mountpoint -q "$EFI_MNT" && umount "$EFI_MNT" || true
+  mountpoint -q "$ROOT_MNT" && umount "$ROOT_MNT" || true
+  if [[ "${BACKUP_MOUNTED_HERE:-0}" -eq 1 ]]; then
+    umount "$BACKUP_MNT" || true
+  fi
+}
+
+ensure_tools() {
+  local missing=()
+  command -v rsync >/dev/null || missing+=(rsync)
+  command -v grub-install >/dev/null || missing+=(grub-efi-amd64 grub-efi-amd64-bin)
+  command -v efibootmgr >/dev/null || missing+=(efibootmgr)
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Installing ${missing[*]}."
+  apt-get update
+  apt-get install -y "${missing[@]}"
+}
+
+find_backup() {
+  BACKUP_DEV=$(blkid -L "Laptop-Backup" || true)
+  [[ -n "${BACKUP_DEV:-}" ]] || die "Drive labeled \"Laptop-Backup\" is not connected."
+  BACKUP_DEV=$(readlink -f "$BACKUP_DEV")
+  BACKUP_DISK=$(disk_of "$BACKUP_DEV")
+}
+
+mount_backup() {
+  local existing
+  existing=$(findmnt -n -o TARGET -S "$BACKUP_DEV" | head -1 || true)
+  BACKUP_MOUNTED_HERE=0
+  if [[ -n "$existing" ]]; then
+    BACKUP_MNT="$existing"
+  else
+    mkdir -p "$BACKUP_MNT"
+    mount -o ro "$BACKUP_DEV" "$BACKUP_MNT" || die "Could not mount $BACKUP_DEV."
+    BACKUP_MOUNTED_HERE=1
+  fi
+  SNAP_ROOT="$BACKUP_MNT/laptop-snapshots"
+  [[ -d "$SNAP_ROOT" ]] || die "No laptop-snapshots folder on the backup drive."
+}
+
+latest_snapshot() {
+  local marker name
+  marker=$(find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type f -name '.complete-*' -printf '%f\n' 2>/dev/null \
+    | sed 's/^\.complete-//' | sort | tail -1)
+  [[ -n "$marker" ]] || die "No finished snapshot. A folder without a .complete marker is incomplete."
+  [[ -d "$SNAP_ROOT/$marker" ]] || die "Snapshot $marker is marked complete but the folder is missing."
+  SNAP_NAME="$marker"
+  SNAP="$SNAP_ROOT/$marker"
+}
+
+find_target_by_uuid() {
+  local root efi root_disk efi_disk
+  root=$(blkid -U "$KNOWN_ROOT_UUID" || true)
+  efi=$(blkid -U "$KNOWN_EFI_UUID" || true)
+  if [[ -z "$root" || -z "$efi" ]]; then
+    return 1
+  fi
+  root=$(readlink -f "$root")
+  efi=$(readlink -f "$efi")
+  root_disk=$(disk_of "$root")
+  efi_disk=$(disk_of "$efi")
+  [[ "$root_disk" == "$efi_disk" ]] || return 1
+  [[ "$root_disk" != "$BACKUP_DISK" ]] || return 1
+  [[ "$(tran_of "$root")" != "usb" ]] || return 1
+  ROOT_DEV="$root"
+  EFI_DEV="$efi"
+  TARGET_DISK="$root_disk"
+  return 0
+}
+
+find_target_by_scan() {
+  local name tran part fstype parttype dev efi_cand root_cand
+  local candidates=()
+  while read -r name tran; do
+    [[ -n "$name" ]] || continue
+    [[ "$tran" == "usb" ]] && continue
+    [[ "/dev/$name" == "$BACKUP_DISK" ]] && continue
+    efi_cand=""
+    root_cand=""
+    while read -r part fstype parttype; do
+      [[ "$part" == "$name" ]] && continue
+      dev="/dev/$part"
+      if [[ "$parttype" == "$EFI_PARTTYPE" ]]; then
+        efi_cand="$dev"
+      elif [[ "$fstype" == "ext4" ]]; then
+        root_cand="$dev"
+      fi
+    done < <(lsblk -P -o NAME,FSTYPE,PARTTYPE "/dev/$name" | awk -F'"' '{
+      name=""; fstype=""; parttype=""
+      for (i = 1; i < NF; i += 2) {
+        key=$i; gsub(/[= ]/, "", key); val=$(i+1)
+        if (key == "NAME") name=val
+        else if (key == "FSTYPE") fstype=val
+        else if (key == "PARTTYPE") parttype=val
+      }
+      print name, fstype, parttype
+    }')
+    if [[ -n "$efi_cand" && -n "$root_cand" && "$efi_cand" != "$root_cand" ]]; then
+      candidates+=("$root_cand|$efi_cand|/dev/$name")
+    fi
+  done < <(lsblk -dn -o NAME,TRAN)
+  if [[ ${#candidates[@]} -ne 1 ]]; then
+    echo "Could not choose the internal disk." >&2
+    echo "Plug in only this laptop's disk and the Laptop-Backup drive, then run the script again." >&2
+    printf '  %s\n' "${candidates[@]:-none found}" >&2
+    exit 1
+  fi
+  ROOT_DEV=${candidates[0]%%|*}
+  local rest=${candidates[0]#*|}
+  EFI_DEV=${rest%%|*}
+  TARGET_DISK=${rest#*|}
+}
+
+refuse_if_running_system() {
+  local src mounted
+  src=$(findmnt -n -o SOURCE / || true)
+  src=$(readlink -f "$src")
+  if [[ "$src" == "$ROOT_DEV" ]]; then
+    die "The internal disk is the system you are running. Boot the Ubuntu thumb drive and choose Try Ubuntu, then run this again."
+  fi
+  mounted=$(findmnt -n -o TARGET -S "$ROOT_DEV" || true)
+  if [[ "$mounted" == "/" ]]; then
+    die "Refusing to restore over the running system."
+  fi
+}
+
+confirm() {
+  echo
+  echo "Snapshot:  $SNAP_NAME"
+  echo "From:      $BACKUP_DEV"
+  echo "Onto root: $ROOT_DEV  ($(lsblk -no SIZE "$ROOT_DEV" | head -1))"
+  echo "Onto EFI:  $EFI_DEV"
+  echo
+  echo "This replaces the files on that internal disk with the snapshot."
+  echo "Type RESTORE to continue."
+  local answer
+  if [[ ! -t 0 ]]; then
+    die "This must be typed at a terminal."
+  fi
+  read -r answer
+  [[ "$answer" == "RESTORE" ]] || die "Nothing was changed."
+}
+
+unmount_if_desktop_mounted() {
+  local dev target
+  for dev in "$ROOT_DEV" "$EFI_DEV"; do
+    while read -r target; do
+      [[ -n "$target" ]] || continue
+      [[ "$target" == "/" ]] && die "Refusing to unmount /."
+      umount "$target" || die "Could not unmount $target. Close any window using it and run this again."
+    done < <(findmnt -n -o TARGET -S "$dev")
+  done
+}
+
+fix_fstab() {
+  local fstab root_uuid efi_uuid tmp
+  fstab="$ROOT_MNT/etc/fstab"
+  [[ -f "$fstab" ]] || die "Restored /etc/fstab is missing, so the disk would not boot. Restore stopped before the bootloader step."
+  root_uuid=$(blkid -s UUID -o value "$ROOT_DEV")
+  efi_uuid=$(blkid -s UUID -o value "$EFI_DEV")
+  tmp=$(mktemp)
+  awk -v root="$root_uuid" -v efi="$efi_uuid" '
+    $0 ~ /^[[:space:]]*#/ || NF < 2 { print; next }
+    {
+      if ($2 == "/" && $1 ~ /^UUID=/) $1 = "UUID=" root
+      else if ($2 == "/" && $1 ~ /^\/dev\/disk\/by-uuid\//) $1 = "/dev/disk/by-uuid/" root
+      else if ($2 == "/boot/efi" && $1 ~ /^UUID=/) $1 = "UUID=" efi
+      else if ($2 == "/boot/efi" && $1 ~ /^\/dev\/disk\/by-uuid\//) $1 = "/dev/disk/by-uuid/" efi
+      print
+    }
+  ' "$fstab" > "$tmp"
+  cat "$tmp" > "$fstab"
+  rm -f "$tmp"
+}
+
+recreate_swap() {
+  if [[ -e "$ROOT_MNT/swap.img" ]]; then
+    return 0
+  fi
+  echo "Recreating the 8 GB swap file."
+  fallocate -l 8G "$ROOT_MNT/swap.img" || dd if=/dev/zero of="$ROOT_MNT/swap.img" bs=1M count=8192 status=progress
+  chmod 600 "$ROOT_MNT/swap.img"
+  mkswap "$ROOT_MNT/swap.img" >/dev/null
+}
+
+install_bootloader() {
+  mkdir -p "$ROOT_MNT/dev" "$ROOT_MNT/proc" "$ROOT_MNT/sys" "$ROOT_MNT/run" "$ROOT_MNT/boot/efi"
+  mount --bind /dev "$ROOT_MNT/dev"
+  mount -t proc proc "$ROOT_MNT/proc"
+  mount -t sysfs sys "$ROOT_MNT/sys"
+  mount --bind /run "$ROOT_MNT/run"
+  if [[ -d /sys/firmware/efi/efivars ]]; then
+    mkdir -p "$ROOT_MNT/sys/firmware/efi/efivars"
+    mount --bind /sys/firmware/efi/efivars "$ROOT_MNT/sys/firmware/efi/efivars"
+  fi
+  mount --bind "$EFI_MNT" "$ROOT_MNT/boot/efi"
+  chroot "$ROOT_MNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
+  chroot "$ROOT_MNT" update-grub
+}
+
+main() {
+  need_root
+  [[ -d /sys/firmware/efi ]] || die "Boot the thumb drive in UEFI mode. This laptop does not use legacy boot."
+  find_backup
+  mount_backup
+  latest_snapshot
+  if ! find_target_by_uuid; then
+    find_target_by_scan
+  fi
+  refuse_if_running_system
+  [[ -d "$SNAP/etc" && -d "$SNAP/boot" && -d "$SNAP/home" ]] || die "Snapshot $SNAP_NAME does not look like a full system copy."
+  confirm
+  ensure_tools
+  trap cleanup EXIT
+  unmount_if_desktop_mounted
+
+  mkdir -p "$ROOT_MNT" "$EFI_MNT"
+  mount "$ROOT_DEV" "$ROOT_MNT" || die "Could not mount $ROOT_DEV."
+  mount "$EFI_DEV" "$EFI_MNT" || die "Could not mount $EFI_DEV."
+
+  echo "Copying $SNAP_NAME onto $ROOT_DEV."
+  set +e
+  rsync -aAXH --numeric-ids --delete --info=progress2,stats2 \
+    --exclude=/lost+found \
+    --exclude=/swapfile \
+    --exclude=/swap.img \
+    --exclude=/tmp/ \
+    --exclude=/var/tmp/ \
+    --exclude=/dev/ \
+    --exclude=/proc/ \
+    --exclude=/sys/ \
+    --exclude=/run/ \
+    --exclude=/mnt/ \
+    --exclude=/media/ \
+    --exclude=/boot/efi/ \
+    "$SNAP/" "$ROOT_MNT/"
+  RC=$?
+  set -e
+  if [[ "$RC" -ne 0 && "$RC" -ne 24 ]]; then
+    die "Copy failed with rsync status $RC. The bootloader was not changed."
+  fi
+
+  if [[ -d "$SNAP/boot/efi/EFI" ]]; then
+    echo "Restoring EFI files onto $EFI_DEV."
+    rsync -a --delete "$SNAP/boot/efi/" "$EFI_MNT/"
+  else
+    die "Snapshot has no EFI files. The bootloader was not changed."
+  fi
+
+  recreate_swap
+  fix_fstab
+  echo "Installing the bootloader."
+  install_bootloader
+  sync
+  echo
+  echo "Restore finished from $SNAP_NAME."
+  echo "Shut down, unplug the thumb drive and the backup drive, and power on."
+}
+
+main "$@"

@@ -1,0 +1,137 @@
+#!/bin/bash
+# Snapshot this laptop onto the drive labeled "Laptop Backup".
+#   full  Complete copy. After it succeeds, older snapshots are removed.
+#   incr  Complete restorable copy. Unchanged files are reused from the
+#         newest snapshot, so the extra space is only what changed.
+set -u
+
+MODE="${1:-}"
+if [[ "$MODE" != "full" && "$MODE" != "incr" ]]; then
+  echo "Usage: laptop-backup full|incr" >&2
+  exit 2
+fi
+
+MNT="/mnt/laptop-backup"
+SNAPDIR="laptop-snapshots"
+LINKPATH="/dev/disk/by-label/Laptop\\x20Backup"
+REPORT_DIR="/srv/maintenance/reports/backup"
+
+mkdir -p "$REPORT_DIR"
+LOG="$REPORT_DIR/$(date '+%Y-%m-%d-%H%M%S')-${MODE}.log"
+ln -sfn "$(basename "$LOG")" "$REPORT_DIR/latest.log"
+exec >>"$LOG" 2>&1
+echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') requested=$MODE ====="
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Must run as root."
+  exit 1
+fi
+
+if [[ ! -e "$LINKPATH" ]]; then
+  echo "Drive labeled \"Laptop Backup\" is not connected. Backup skipped."
+  exit 1
+fi
+DEV=$(readlink -f "$LINKPATH")
+
+MOUNTPOINT=$(findmnt -n -o TARGET -S "$DEV" | head -1 || true)
+MOUNTED_HERE=0
+if [[ -z "$MOUNTPOINT" ]]; then
+  mkdir -p "$MNT"
+  if ! mount "$DEV" "$MNT"; then
+    echo "Could not mount $DEV."
+    exit 1
+  fi
+  MOUNTPOINT="$MNT"
+  MOUNTED_HERE=1
+fi
+
+DEST_ROOT="$MOUNTPOINT/$SNAPDIR"
+mkdir -p "$DEST_ROOT"
+
+latest_complete() {
+  find "$DEST_ROOT" -mindepth 1 -maxdepth 1 -type f -name '.complete-*' -printf '%f\n' 2>/dev/null \
+    | sed 's/^\.complete-//' | sort | tail -1
+}
+
+STAMP=$(date '+%Y-%m-%d')
+RUN_MODE="$MODE"
+PREV=""
+if [[ "$RUN_MODE" == "incr" ]]; then
+  PREV=$(latest_complete || true)
+  if [[ -z "$PREV" || ! -d "$DEST_ROOT/$PREV" ]]; then
+    echo "No completed snapshot yet. This run will be a full copy."
+    RUN_MODE="full"
+    PREV=""
+  fi
+fi
+
+NAME="${STAMP}-${RUN_MODE}"
+if [[ -e "$DEST_ROOT/$NAME" || -e "$DEST_ROOT/.complete-$NAME" ]]; then
+  NAME="${STAMP}-${RUN_MODE}-$(date '+%H%M%S')"
+fi
+DEST="$DEST_ROOT/$NAME"
+mkdir -p "$DEST"
+
+RSYNC=(rsync -aAXH --numeric-ids --delete --one-file-system --info=stats2)
+if [[ -n "$PREV" ]]; then
+  RSYNC+=(--link-dest="$DEST_ROOT/$PREV")
+  echo "Incremental snapshot $NAME, reusing unchanged files from $PREV"
+else
+  echo "Full snapshot $NAME"
+fi
+
+cleanup_fail() {
+  echo "Backup failed. Removing incomplete snapshot $NAME."
+  rm -rf "$DEST"
+  rm -f "$DEST_ROOT/.complete-$NAME"
+  if [[ "$MOUNTED_HERE" -eq 1 ]]; then
+    umount "$MNT" || true
+  fi
+}
+
+set +e
+"${RSYNC[@]}" \
+  --exclude=/lost+found \
+  --exclude=/swapfile \
+  --exclude=/swap.img \
+  --exclude=/tmp/ \
+  --exclude=/var/tmp/ \
+  --exclude=/var/cache/apt/archives/ \
+  --exclude='/home/*/.cache/' \
+  --exclude='/root/.cache/' \
+  / "$DEST/"
+RC=$?
+set -e
+if [[ "$RC" -ne 0 && "$RC" -ne 24 ]]; then
+  echo "rsync of / failed with status $RC."
+  cleanup_fail
+  exit "$RC"
+fi
+
+if mountpoint -q /boot/efi; then
+  mkdir -p "$DEST/boot/efi"
+  set +e
+  rsync -a --delete /boot/efi/ "$DEST/boot/efi/"
+  EFI_RC=$?
+  set -e
+  if [[ "$EFI_RC" -ne 0 && "$EFI_RC" -ne 24 ]]; then
+    echo "rsync of /boot/efi failed with status $EFI_RC."
+    cleanup_fail
+    exit "$EFI_RC"
+  fi
+fi
+
+touch "$DEST_ROOT/.complete-$NAME"
+echo "Snapshot ready: $DEST"
+
+# A full backup replaces the older restore points. The incrementals taken
+# after this full are created later and are left in place until the next full.
+if [[ "$MODE" == "full" ]]; then
+  echo "Removing snapshots older than $NAME."
+  find "$DEST_ROOT" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) \
+    ! -name "$NAME" ! -name ".complete-$NAME" -print -exec rm -rf {} +
+fi
+
+df -h "$MOUNTPOINT" | tail -1
+echo "Finished $(date '+%Y-%m-%d %H:%M:%S %Z')"
+exit 0

@@ -1,0 +1,11 @@
+[Unit]
+Description=Full laptop backup Monday at 12:01 AM
+
+[Timer]
+OnCalendar=Mon *-*-* 00:01:00
+AccuracySec=1s
+Persistent=true
+Unit=laptop-backup@full.service
+
+[Install]
+WantedBy=timers.target

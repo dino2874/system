@@ -1,0 +1,23 @@
+Restore this laptop from the Laptop-Backup drive
+
+1. Boot this thumb drive and choose "Try or Install Ubuntu".
+   Do not start the installer.
+2. Plug in the drive labeled Laptop-Backup.
+3. Open a terminal and run:
+
+   sudo bash /media/ubuntu/writable/laptop/laptop-restore
+
+   If that path is not there, run:
+
+   sudo bash "$(find /media -path '*/laptop/laptop-restore' -print -quit)"
+
+4. The script shows the snapshot and the internal disk it will replace.
+   Nothing is copied until you type RESTORE.
+5. When it says the restore finished, shut down, unplug both USB drives,
+   and turn the laptop on.
+
+The script copies the newest finished snapshot, including your home folder
+and installed programs, then puts the EFI files back and reinstalls the
+bootloader. The same script is stored at /usr/local/sbin/laptop-restore
+on the laptop, and it is copied here so it is still available if the
+laptop disk will not boot.

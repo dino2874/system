@@ -1,0 +1,11 @@
+[Unit]
+Description=Incremental laptop backup Wednesday, Friday, and Sunday at 12:01 AM
+
+[Timer]
+OnCalendar=Wed,Fri,Sun *-*-* 00:01:00
+AccuracySec=1s
+Persistent=true
+Unit=laptop-backup@incr.service
+
+[Install]
+WantedBy=timers.target
