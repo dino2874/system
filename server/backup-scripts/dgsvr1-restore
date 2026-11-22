@@ -1,0 +1,265 @@
+#!/bin/bash
+# Restore dgsvr1 from the newest finished snapshot on the drive labeled
+# "dgsvr1-backup".
+#
+# Boot this thumb drive on the server, choose "Try or Install Ubuntu",
+# plug in the Samsung drive, and run:
+#   sudo bash /media/ubuntu/writable/server/dgsvr1-restore
+#
+# Nothing is copied until you type RESTORE.
+set -u
+
+ROOT_UUID="e8bec07a-55ed-4328-b1f9-e36e5a15f22e"
+EFI_UUID="9D76-9E58"
+DATA_UUID="16de7e04-a423-48c7-a568-44eff14c0445"
+DATA2_UUID="eede09aa-234f-4661-8e7d-2910fe728633"
+
+BACKUP_MNT="/mnt/dgsvr1-backup-src"
+ROOT_MNT="/mnt/restore-root"
+EFI_MNT="/mnt/restore-efi"
+DATA_MNT="/mnt/restore-data"
+DATA2_MNT="/mnt/restore-data2"
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+need_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "Run this with sudo from the Ubuntu thumb drive."
+  fi
+}
+
+cleanup() {
+  mountpoint -q "$ROOT_MNT/dev" && umount "$ROOT_MNT/dev" || true
+  mountpoint -q "$ROOT_MNT/proc" && umount "$ROOT_MNT/proc" || true
+  mountpoint -q "$ROOT_MNT/sys/firmware/efi/efivars" && umount "$ROOT_MNT/sys/firmware/efi/efivars" || true
+  mountpoint -q "$ROOT_MNT/sys" && umount "$ROOT_MNT/sys" || true
+  mountpoint -q "$ROOT_MNT/run" && umount "$ROOT_MNT/run" || true
+  mountpoint -q "$ROOT_MNT/boot/efi" && umount "$ROOT_MNT/boot/efi" || true
+  mountpoint -q "$EFI_MNT" && umount "$EFI_MNT" || true
+  mountpoint -q "$DATA_MNT" && umount "$DATA_MNT" || true
+  mountpoint -q "$DATA2_MNT" && umount "$DATA2_MNT" || true
+  mountpoint -q "$ROOT_MNT" && umount "$ROOT_MNT" || true
+  if [[ "${BACKUP_MOUNTED_HERE:-0}" -eq 1 ]]; then
+    umount "$BACKUP_MNT" || true
+  fi
+}
+
+ensure_tools() {
+  local missing=()
+  command -v rsync >/dev/null || missing+=(rsync)
+  command -v grub-install >/dev/null || missing+=(grub-efi-amd64 grub-efi-amd64-bin)
+  command -v efibootmgr >/dev/null || missing+=(efibootmgr)
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Installing ${missing[*]}."
+  apt-get update
+  apt-get install -y "${missing[@]}"
+}
+
+find_backup() {
+  BACKUP_DEV=$(blkid -L "dgsvr1-backup" || true)
+  [[ -n "${BACKUP_DEV:-}" ]] || die "Drive labeled \"dgsvr1-backup\" is not connected."
+  BACKUP_DEV=$(readlink -f "$BACKUP_DEV")
+}
+
+mount_backup() {
+  local existing
+  existing=$(findmnt -n -o TARGET -S "$BACKUP_DEV" | head -1 || true)
+  BACKUP_MOUNTED_HERE=0
+  if [[ -n "$existing" ]]; then
+    BACKUP_MNT="$existing"
+  else
+    mkdir -p "$BACKUP_MNT"
+    mount -o ro "$BACKUP_DEV" "$BACKUP_MNT" || die "Could not mount $BACKUP_DEV."
+    BACKUP_MOUNTED_HERE=1
+  fi
+  SNAP_ROOT="$BACKUP_MNT/dgsvr1-snapshots"
+  [[ -d "$SNAP_ROOT" ]] || die "No dgsvr1-snapshots folder on the backup drive. A server backup has not been written yet."
+}
+
+latest_snapshot() {
+  local marker
+  marker=$(find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type f -name '.complete-*' -printf '%f\n' 2>/dev/null \
+    | sed 's/^\.complete-//' | sort | tail -1)
+  [[ -n "$marker" ]] || die "No finished server snapshot. A folder without a .complete marker is incomplete."
+  [[ -d "$SNAP_ROOT/$marker/root" ]] || die "Snapshot $marker has no root folder."
+  [[ -d "$SNAP_ROOT/$marker/efi/EFI" ]] || die "Snapshot $marker has no EFI files."
+  [[ -d "$SNAP_ROOT/$marker/data" ]] || die "Snapshot $marker has no data folder."
+  [[ -d "$SNAP_ROOT/$marker/data2" ]] || die "Snapshot $marker has no data2 folder."
+  SNAP_NAME="$marker"
+  SNAP="$SNAP_ROOT/$marker"
+}
+
+resolve_dev() {
+  local uuid dev
+  uuid="$1"
+  dev=$(blkid -U "$uuid" || true)
+  [[ -n "$dev" ]] || die "Disk $uuid is not connected. Boot this stick on dgsvr1."
+  readlink -f "$dev"
+}
+
+find_targets() {
+  ROOT_DEV=$(resolve_dev "$ROOT_UUID")
+  EFI_DEV=$(resolve_dev "$EFI_UUID")
+  DATA_DEV=$(resolve_dev "$DATA_UUID")
+  DATA2_DEV=$(resolve_dev "$DATA2_UUID")
+  [[ "$ROOT_DEV" != "$BACKUP_DEV" && "$DATA_DEV" != "$BACKUP_DEV" && "$DATA2_DEV" != "$BACKUP_DEV" ]] \
+    || die "A server disk and the backup drive resolved to the same device."
+}
+
+refuse_if_running_system() {
+  local src
+  src=$(findmnt -n -o SOURCE / || true)
+  src=$(readlink -f "$src")
+  if [[ "$src" == "$ROOT_DEV" ]]; then
+    die "dgsvr1 is the system you are running. Boot the Ubuntu thumb drive and choose Try Ubuntu, then run this again."
+  fi
+}
+
+confirm() {
+  echo
+  echo "Snapshot:  $SNAP_NAME"
+  echo "From:      $BACKUP_DEV"
+  echo "Onto root: $ROOT_DEV  (Kingston system disk)"
+  echo "Onto EFI:  $EFI_DEV"
+  echo "Onto data: $DATA_DEV  (Toshiba /data)"
+  echo "Onto data2: $DATA2_DEV  (WD Black /data2)"
+  echo
+  echo "This replaces the files on those dgsvr1 disks with the snapshot."
+  echo "Type RESTORE to continue."
+  local answer
+  if [[ ! -t 0 ]]; then
+    die "This must be typed at a terminal."
+  fi
+  read -r answer
+  [[ "$answer" == "RESTORE" ]] || die "Nothing was changed."
+}
+
+unmount_targets() {
+  local dev target
+  for dev in "$ROOT_DEV" "$EFI_DEV" "$DATA_DEV" "$DATA2_DEV"; do
+    while read -r target; do
+      [[ -n "$target" ]] || continue
+      [[ "$target" == "/" ]] && die "Refusing to unmount /."
+      umount "$target" || die "Could not unmount $target. Close any window using it and run this again."
+    done < <(findmnt -n -o TARGET -S "$dev")
+  done
+}
+
+copy_tree() {
+  local src dest label rc
+  src="$1"
+  dest="$2"
+  label="$3"
+  echo "Copying $label."
+  set +e
+  rsync -aAXH --numeric-ids --delete --info=progress2,stats2 \
+    --exclude=/lost+found \
+    --exclude=/swapfile \
+    --exclude=/swap.img \
+    --exclude=/tmp/ \
+    --exclude=/var/tmp/ \
+    --exclude=/dev/ \
+    --exclude=/proc/ \
+    --exclude=/sys/ \
+    --exclude=/run/ \
+    --exclude=/mnt/ \
+    --exclude=/media/ \
+    --exclude=/boot/efi/ \
+    "$src/" "$dest/"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 && "$rc" -ne 24 ]]; then
+    die "Copy of $label failed with rsync status $rc. The bootloader was not changed."
+  fi
+}
+
+fix_fstab() {
+  local fstab tmp
+  fstab="$ROOT_MNT/etc/fstab"
+  [[ -f "$fstab" ]] || die "Restored /etc/fstab is missing. Restore stopped before the bootloader step."
+  tmp=$(mktemp)
+  awk -v root="$ROOT_UUID" -v efi="$EFI_UUID" -v data="$DATA_UUID" -v data2="$DATA2_UUID" '
+    function setspec(mount, uuid) {
+      if ($2 != mount) return
+      if ($1 ~ /^UUID=/) $1 = "UUID=" uuid
+      else if ($1 ~ /^\/dev\/disk\/by-uuid\//) $1 = "/dev/disk/by-uuid/" uuid
+    }
+    $0 ~ /^[[:space:]]*#/ || NF < 2 { print; next }
+    {
+      setspec("/", root)
+      setspec("/boot/efi", efi)
+      setspec("/data", data)
+      setspec("/data2", data2)
+      print
+    }
+  ' "$fstab" > "$tmp"
+  cat "$tmp" > "$fstab"
+  rm -f "$tmp"
+}
+
+recreate_swap() {
+  if [[ -e "$ROOT_MNT/swap.img" ]]; then
+    return 0
+  fi
+  echo "Recreating the 8 GB swap file."
+  fallocate -l 8G "$ROOT_MNT/swap.img" || dd if=/dev/zero of="$ROOT_MNT/swap.img" bs=1M count=8192 status=progress
+  chmod 600 "$ROOT_MNT/swap.img"
+  mkswap "$ROOT_MNT/swap.img" >/dev/null
+}
+
+install_bootloader() {
+  mkdir -p "$ROOT_MNT/dev" "$ROOT_MNT/proc" "$ROOT_MNT/sys" "$ROOT_MNT/run" "$ROOT_MNT/boot/efi"
+  mount --bind /dev "$ROOT_MNT/dev"
+  mount -t proc proc "$ROOT_MNT/proc"
+  mount -t sysfs sys "$ROOT_MNT/sys"
+  mount --bind /run "$ROOT_MNT/run"
+  if [[ -d /sys/firmware/efi/efivars ]]; then
+    mkdir -p "$ROOT_MNT/sys/firmware/efi/efivars"
+    mount --bind /sys/firmware/efi/efivars "$ROOT_MNT/sys/firmware/efi/efivars"
+  fi
+  mount --bind "$EFI_MNT" "$ROOT_MNT/boot/efi"
+  chroot "$ROOT_MNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
+  chroot "$ROOT_MNT" update-grub
+}
+
+main() {
+  need_root
+  [[ -d /sys/firmware/efi ]] || die "Boot the thumb drive in UEFI mode."
+  find_backup
+  mount_backup
+  latest_snapshot
+  find_targets
+  refuse_if_running_system
+  [[ -d "$SNAP/root/etc" && -d "$SNAP/root/home" && -d "$SNAP/root/usr" ]] \
+    || die "Snapshot $SNAP_NAME does not look like a full system copy."
+  confirm
+  ensure_tools
+  trap cleanup EXIT
+  unmount_targets
+
+  mkdir -p "$ROOT_MNT" "$EFI_MNT" "$DATA_MNT" "$DATA2_MNT"
+  mount "$ROOT_DEV" "$ROOT_MNT" || die "Could not mount $ROOT_DEV."
+  mount "$EFI_DEV" "$EFI_MNT" || die "Could not mount $EFI_DEV."
+  mount "$DATA_DEV" "$DATA_MNT" || die "Could not mount $DATA_DEV."
+  mount "$DATA2_DEV" "$DATA2_MNT" || die "Could not mount $DATA2_DEV."
+
+  copy_tree "$SNAP/root" "$ROOT_MNT" "root"
+  copy_tree "$SNAP/efi" "$EFI_MNT" "EFI"
+  copy_tree "$SNAP/data" "$DATA_MNT" "/data"
+  copy_tree "$SNAP/data2" "$DATA2_MNT" "/data2"
+  recreate_swap
+  fix_fstab
+  echo "Installing the bootloader."
+  install_bootloader
+  sync
+  echo
+  echo "Restore finished from $SNAP_NAME."
+  echo "Shut down, unplug the thumb drive and the backup drive, and power on."
+}
+
+main "$@"

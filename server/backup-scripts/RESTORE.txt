@@ -1,0 +1,19 @@
+Restore dgsvr1 from the dgsvr1-backup drive
+
+1. Boot this thumb drive on the server and choose "Try or Install Ubuntu".
+   Do not start the installer.
+2. Plug in the Samsung drive. The server files are on the partition
+   labeled dgsvr1-backup.
+3. Open a terminal and run:
+
+   sudo bash /media/ubuntu/writable/server/dgsvr1-restore
+
+4. The script shows the snapshot and the three server disks it will
+   replace: the Kingston system disk, the Toshiba /data disk, and the
+   WD Black /data2 disk. Nothing is copied until you type RESTORE.
+5. When it says the restore finished, shut down, unplug both USB drives,
+   and turn the server on.
+
+A finished snapshot is a folder under dgsvr1-snapshots with root, efi,
+data, and data2 inside it, plus a .complete marker. The script stops
+if that snapshot is not on the drive.
