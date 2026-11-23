@@ -1,5 +1,8 @@
 Restore dgsvr1 from the dgsvr1-backup drive
 
+Nightly backups are pulled by the laptop while the Samsung drive is
+plugged into the laptop. On a restore day, move the drive to the server.
+
 1. Boot this thumb drive on the server and choose "Try or Install Ubuntu".
    Do not start the installer.
 2. Plug in the Samsung drive. The server files are on the partition

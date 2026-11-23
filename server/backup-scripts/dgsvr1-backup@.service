@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull dgsvr1 %i backup onto the drive plugged into this laptop
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/sbin/dgsvr1-backup %i

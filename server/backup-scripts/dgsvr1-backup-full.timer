@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull a full dgsvr1 backup Tuesday at 12:01 AM
+
+[Timer]
+OnCalendar=Tue *-*-* 00:01:00
+AccuracySec=1s
+Persistent=true
+WakeSystem=true
+Unit=dgsvr1-backup@full.service
+
+[Install]
+WantedBy=timers.target

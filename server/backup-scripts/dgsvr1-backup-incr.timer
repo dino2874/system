@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull an incremental dgsvr1 backup Thursday and Saturday at 12:01 AM
+
+[Timer]
+OnCalendar=Thu,Sat *-*-* 00:01:00
+AccuracySec=1s
+Persistent=true
+WakeSystem=true
+Unit=dgsvr1-backup@incr.service
+
+[Install]
+WantedBy=timers.target
